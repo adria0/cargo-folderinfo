@@ -40,8 +40,8 @@ fn process_folder(path : &Path) -> Option<Project> {
         for (k,v) in v2table(&toml) {
             match k.as_str() {
                 "package" => {
-                    desc = v2table(v).get("description").and_then(|v| Some(v2str(v))).cloned();
-                    name = v2table(v).get("name").and_then(|v| Some(v2str(v))).cloned();
+                    desc = v2table(v).get("description").map(|v| v2str(v)).cloned();
+                    name = v2table(v).get("name").map(|v| v2str(v)).cloned();
                 }
                 "dependencies" => {
                     let depends = match v {
@@ -78,7 +78,7 @@ fn process_folder(path : &Path) -> Option<Project> {
 fn pad_text(s : &str, max_column_size: usize) -> Vec<String> {
     let mut current = "".to_string();
     let mut formatted = Vec::new(); 
-    for word in s.split(" ") {
+    for word in s.split(' ') {
         if word.len() + current.len() + 1 > max_column_size {
             formatted.push(current);
             current = word.to_owned();
@@ -89,7 +89,7 @@ fn pad_text(s : &str, max_column_size: usize) -> Vec<String> {
         }
     }
     formatted.push(current);
-    return formatted;
+    formatted
 }
 
 fn collect_crate_names(p: &Project) -> Vec<String> {
@@ -109,7 +109,7 @@ fn print_project(p: &Project) {
         (0..n).map(|_| s).collect::<String>()
     }
 
-    fn print_project_1(p: &Project, crates: &Vec<String>, level: usize) {
+    fn print_project_1(p: &Project, crates: &[String], level: usize) {
         let max_size = 80;
 
         let mut text = String::from("[");
@@ -158,7 +158,7 @@ fn main() {
     println!(" <folder-name> - [<crate-name>] crate-description");
     println!("                 < internal dependencies");
     println!("                 > external dependencies");
-    println!("");
+    println!();
 
     print_project(&all.unwrap());
 }
