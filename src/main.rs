@@ -4,16 +4,45 @@ use std::path::Path;
 extern crate itertools;
 extern crate toml;
 
+use std::collections::HashMap;
 use std::string::ToString;
 use toml::Value;
+
+use structopt::clap::arg_enum;
+use structopt::StructOpt;
+
+arg_enum! {
+    #[derive(Debug)]
+    enum OutputFormat {
+        Dot,
+        Text,
+    }
+}
+
+struct Void {}
+type StringSet = HashMap<String, Void>;
+
+#[derive(Debug, StructOpt)]
+#[structopt(name = "folderinfo", about = "Crate info")]
+struct Opt {
+    /// Select output format, can be Text (default) or Dot
+    #[structopt(long)]
+    format: Option<OutputFormat>,
+    /// Comma-separated list of crates to ignore
+    #[structopt(long)]
+    ignore: Option<String>,
+    /// Comma-separated list of crates to highlight: all_directions,+from,-to
+    #[structopt(long)]
+    highlight: Option<String>,
+}
 
 #[derive(Debug)]
 struct Project {
     folder: String,
-    name: Option<String>,
+    name: String,
     desc: Option<String>,
-    sub: Vec<Project>,
-    dep: Vec<String>,
+    subs: Vec<Project>,
+    deps: Vec<String>,
 }
 
 fn v2table(v: &toml::Value) -> &toml::value::Table {
@@ -33,8 +62,8 @@ fn process_folder(path: &Path) -> Option<Project> {
     if let Ok(toml_content) = fs::read_to_string(path.join("Cargo.toml")) {
         let toml = toml_content.parse::<Value>().expect("Unable to parse toml");
 
-        let mut sub = Vec::new();
-        let mut dep = Vec::new();
+        let mut subs = Vec::new();
+        let mut deps = Vec::new();
         let mut name = None;
         let mut desc = None;
         for (k, v) in v2table(&toml) {
@@ -49,12 +78,12 @@ fn process_folder(path: &Path) -> Option<Project> {
                         _ => panic!("bad dependencies"),
                     };
 
-                    dep.extend_from_slice(&depends.keys().cloned().collect::<Vec<_>>());
+                    deps.extend_from_slice(&depends.keys().cloned().collect::<Vec<_>>());
                 }
                 _ => {
                     if k.starts_with("dependencies.") {
                         let (_, dependency) = k.split_at("dependencies.".len());
-                        dep.push(dependency.to_string());
+                        deps.push(dependency.to_string());
                     }
                 }
             }
@@ -64,18 +93,19 @@ fn process_folder(path: &Path) -> Option<Project> {
             let entry = entry.unwrap().path();
             if entry.is_dir() {
                 if let Some(sub_project) = process_folder(&entry) {
-                    sub.push(sub_project);
+                    subs.push(sub_project);
                 }
             }
         }
         let folder = path
             .file_name()
             .map_or("".to_string(), |v| v.to_os_string().into_string().unwrap());
+
         Some(Project {
             desc,
-            sub,
-            dep,
-            name,
+            subs,
+            deps,
+            name: name.unwrap_or_else(|| panic!(format!("Crate without name in {:?}", path))),
             folder,
         })
     } else {
@@ -100,29 +130,27 @@ fn pad_text(s: &str, max_column_size: usize) -> Vec<String> {
     formatted
 }
 
-fn collect_crate_names(p: &Project) -> Vec<String> {
-    fn collect(p: &Project, names: &mut Vec<String>) {
-        names.push(p.name.clone().unwrap());
-        for sub in &p.sub {
+fn collect_crate_names(p: &Project) -> StringSet {
+    fn collect(p: &Project, names: &mut StringSet) {
+        names.insert(p.name.clone(), Void {});
+        for sub in &p.subs {
             collect(sub, names);
         }
     }
-    let mut names = Vec::new();
+    let mut names = StringSet::new();
     collect(p, &mut names);
     names
 }
 
-fn print_project(p: &Project) {
+fn print_project_text(p: &Project) {
     fn repeat(s: &str, n: usize) -> String {
         (0..n).map(|_| s).collect::<String>()
     }
 
-    fn print_project_1(p: &Project, crates: &[String], level: usize) {
+    fn print_project_1(p: &Project, crates: &StringSet, level: usize) {
         let max_size = 80;
 
-        let mut text = String::from("[");
-        text.push_str(p.name.as_ref().map_or("", |v| v));
-        text.push_str("] ");
+        let mut text = format!("[{}] ", p.name);
         text.push_str(p.desc.as_ref().map_or("<no desc>", |d| &d));
 
         let left_margin = repeat("   |", level);
@@ -137,10 +165,9 @@ fn print_project(p: &Project) {
             }
         }
 
-        let (in_workspace, outside_workspace): (Vec<_>, Vec<_>) = p
-            .dep
-            .iter()
-            .partition(|dep| crates.iter().any(|p| &p == dep));
+        let (in_workspace, outside_workspace): (Vec<_>, Vec<_>) =
+            p.deps.iter().partition(|dep| crates.contains_key(*dep));
+
         let (in_workspace, outside_workspace) = (
             itertools::join(in_workspace, ", "),
             itertools::join(outside_workspace, ", "),
@@ -156,22 +183,98 @@ fn print_project(p: &Project) {
                 println!("{}{}   > {}", left_margin, folder_spaces, line);
             }
         }
-        for sub in p.sub.iter() {
+        for sub in p.subs.iter() {
             println!("{}", repeat("   |", level));
             print_project_1(&sub, &crates, level + 1);
         }
     }
     let crates = collect_crate_names(p);
-    print_project_1(p, &crates, 0);
-}
 
-fn main() {
-    let all = process_folder(Path::new("."));
-    println!("Rust folderinfo dump format:");
+    println!("dump format:");
     println!(" <folder-name> - [<crate-name>] crate-description");
     println!("                 < internal dependencies");
     println!("                 > external dependencies");
     println!();
+    print_project_1(p, &crates, 0);
+}
 
-    print_project(&all.unwrap());
+fn print_project_dot(p: &Project, ignore_crates: &StringSet, highlight_crates: &StringSet) {
+    fn print_clusters_1(p: &Project) {
+        if !p.subs.is_empty() {
+            println!("subgraph cluster_{} {{", p.name.replace("-", "_"));
+            println!("label=\"{}\"", p.name);
+        }
+        println!("\"{}\"", p.name);
+        for sub in p.subs.iter() {
+            print_clusters_1(&sub);
+        }
+        if !p.subs.is_empty() {
+            println!("}}");
+        }
+    }
+    fn print_nodes_1(p: &Project, ignore: &StringSet, highlight: &StringSet, crates: &StringSet) {
+        let internal_deps = p.deps.iter().filter(|dep| crates.keys().any(|p| &p == dep));
+        for dep in internal_deps {
+            let (from, to) = (&p.name, dep);
+
+            let no_ignores = || !ignore.contains_key(from) && !ignore.contains_key(to);
+            let internal_dep_is_a_submodule = || p.subs.iter().any(|sub| &sub.name == dep);
+
+            if no_ignores() && !internal_dep_is_a_submodule() {
+                let attrs = if highlight.is_empty() {
+                    ""
+                } else {
+                    let mut color = "[color=transparent]";
+                    for h in highlight.keys() {
+                        if h.starts_with('+') && from == &h[1..] {
+                            color = "[color=blue]";
+                            break;
+                        } else if h.starts_with('-') && to == &h[1..] {
+                            color = "[color=red]";
+                            break;
+                        } else if from == h || to == h {
+                            color = "[color=black]";
+                            break;
+                        }
+                    }
+                    color
+                };
+                println!("\"{}\" -> \"{}\" {}", from, to, attrs);
+            }
+        }
+        for sub in p.subs.iter() {
+            print_nodes_1(&sub, ignore, highlight, &crates);
+        }
+    }
+
+    let crates = collect_crate_names(p);
+    println!("digraph G {{");
+    print_clusters_1(p);
+    print_nodes_1(p, ignore_crates, highlight_crates, &crates);
+    println!("}}");
+}
+
+fn main() {
+    let opt = Opt::from_args();
+
+    let all = process_folder(Path::new(".")).expect("Cannot process folder");
+
+    let optional_list = |l: Option<String>| {
+        let mut set = StringSet::new();
+        if let Some(l) = l {
+            for e in l.split(',') {
+                set.insert(e.to_string(), Void {});
+            }
+        }
+        set
+    };
+
+    let output_format = opt.format.unwrap_or(OutputFormat::Text);
+    let ignore_crates = optional_list(opt.ignore);
+    let highlight_crates = optional_list(opt.highlight);
+
+    match output_format {
+        OutputFormat::Text => print_project_text(&all),
+        OutputFormat::Dot => print_project_dot(&all, &ignore_crates, &highlight_crates),
+    };
 }
